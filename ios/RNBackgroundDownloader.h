@@ -17,6 +17,11 @@
 
 typedef void (^CompletionHandler)();
 
+typedef enum {
+    kDownloadManagerStateForeground,
+    kDownloadManagerStateBackground
+} DownloadManagerState;
+
 @interface RNBackgroundDownloader : RCTEventEmitter <RCTBridgeModule, NSURLSessionDelegate, NSURLSessionDownloadDelegate>
 
 + (void)setCompletionHandlerWithIdentifier: (NSString *)identifier completionHandler: (CompletionHandler)completionHandler;

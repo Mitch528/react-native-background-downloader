@@ -14,14 +14,15 @@
 static CompletionHandler storedCompletionHandler;
 
 @implementation RNBackgroundDownloader {
-    NSURLSession *urlSession;
-    NSURLSessionConfiguration *sessionConfig;
+    NSURLSession *backgroundSession;
+    NSURLSession *foregroundSession;
     NSMutableDictionary<NSNumber *, RNBGDTaskConfig *> *taskToConfigMap;
     NSMutableDictionary<NSString *, NSURLSessionDownloadTask *> *idToTaskMap;
     NSMutableDictionary<NSString *, NSData *> *idToResumeDataMap;
     NSMutableDictionary<NSString *, NSNumber *> *idToPercentMap;
     NSMutableDictionary<NSString *, NSDictionary *> *progressReports;
     NSDate *lastProgressReport;
+    DownloadManagerState state;
     NSNumber *sharedLock;
 }
 
@@ -62,19 +63,32 @@ RCT_EXPORT_MODULE();
         idToTaskMap = [[NSMutableDictionary alloc] init];
         idToResumeDataMap= [[NSMutableDictionary alloc] init];
         idToPercentMap = [[NSMutableDictionary alloc] init];
-        NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
-        NSString *sessonIdentifier = [bundleIdentifier stringByAppendingString:@".backgrounddownloadtask"];
-        sessionConfig = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:sessonIdentifier];
         progressReports = [[NSMutableDictionary alloc] init];
         lastProgressReport = [[NSDate alloc] init];
         sharedLock = [NSNumber numberWithInt:1];
+        state = kDownloadManagerStateForeground;
+        
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(appWillResignActive:) name:UIApplicationWillResignActiveNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(appWillEnterForeground:) name:UIApplicationWillEnterForegroundNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(appWillTerminate:) name:UIApplicationWillTerminateNotification object:nil];
     }
     return self;
 }
 
 - (void)lazyInitSession {
-    if (urlSession == nil) {
-        urlSession = [NSURLSession sessionWithConfiguration:sessionConfig delegate:self delegateQueue:nil];
+    NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
+    NSString *sessonIdentifier = [bundleIdentifier stringByAppendingString:@".backgrounddownloadtask"];
+    
+    if (backgroundSession == nil) {
+        NSURLSessionConfiguration* backgroundSessionConfig = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:sessonIdentifier];
+        
+        backgroundSession = [NSURLSession sessionWithConfiguration:backgroundSessionConfig delegate:self delegateQueue:nil];
+    }
+    
+    if (foregroundSession == nil) {
+        NSURLSessionConfiguration* foregroundSessionConfig = [NSURLSessionConfiguration defaultSessionConfiguration];
+        
+        foregroundSession = [NSURLSession sessionWithConfiguration:foregroundSessionConfig delegate:self delegateQueue:nil];
     }
 }
 
@@ -91,10 +105,64 @@ RCT_EXPORT_MODULE();
             [idToPercentMap removeObjectForKey:taskConfig.id];
         }
         if (taskToConfigMap.count == 0) {
-            [urlSession invalidateAndCancel];
-            urlSession = nil;
+            [foregroundSession invalidateAndCancel];
+            foregroundSession = nil;
         }
     }
+}
+
+- (void)appWillEnterForeground:(NSNotification*)note {
+    if (state == kDownloadManagerStateBackground) {
+        [backgroundSession getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
+            for (NSURLSessionDownloadTask *backgroundTask in downloadTasks) {
+                [backgroundTask cancelByProducingResumeData:^(NSData *resumeData) {
+                    NSURLSessionDownloadTask *downloadTask = [foregroundSession downloadTaskWithResumeData:resumeData];
+                    [downloadTask resume];
+                    
+                    RNBGDTaskConfig *taskConfig = taskToConfigMap[@(backgroundTask.taskIdentifier)];
+                    if (taskConfig) {
+                        idToTaskMap[taskConfig.id] = downloadTask;
+                        taskToConfigMap[@(downloadTask.taskIdentifier)] = taskConfig;
+                        
+                        [[NSUserDefaults standardUserDefaults] setObject:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
+                    }
+                }];
+            }
+        }];
+
+        state = kDownloadManagerStateForeground;
+    }
+}
+
+-(void)appWillResignActive:(NSNotification*)note
+{
+    if (state == kDownloadManagerStateForeground) {
+        [foregroundSession getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
+            for (NSURLSessionDownloadTask *foregroundTask in downloadTasks) {
+                RNBGDTaskConfig *taskConfig = taskToConfigMap[@(foregroundTask.taskIdentifier)];
+                
+                [foregroundTask cancelByProducingResumeData:^(NSData *resumeData) {
+                    NSURLSessionDownloadTask *downloadTask = [backgroundSession downloadTaskWithResumeData:resumeData];
+                    [downloadTask resume];
+                    if (taskConfig) {
+                        idToTaskMap[taskConfig.id] = downloadTask;
+                        taskToConfigMap[@(downloadTask.taskIdentifier)] = taskConfig;
+                        
+                        [[NSUserDefaults standardUserDefaults] setObject:[self serialize: taskToConfigMap] forKey:ID_TO_CONFIG_MAP_KEY];
+                    }
+                }];
+            }
+        }];
+
+        state = kDownloadManagerStateBackground;
+    }
+}
+
+-(void)appWillTerminate:(NSNotification*)note
+{
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationWillResignActiveNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationWillEnterForegroundNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationWillTerminateNotification object:nil];
 }
 
 + (void)setCompletionHandlerWithIdentifier: (NSString *)identifier completionHandler: (CompletionHandler)completionHandler {
@@ -126,7 +194,7 @@ RCT_EXPORT_METHOD(download: (NSDictionary *) options) {
     }
     
     @synchronized (sharedLock) {
-        NSURLSessionDownloadTask __strong *task = [urlSession downloadTaskWithRequest:request];
+        NSURLSessionDownloadTask __strong *task = [foregroundSession downloadTaskWithRequest:request];
         RNBGDTaskConfig *taskConfig = [[RNBGDTaskConfig alloc] initWithDictionary: @{@"id": identifier, @"destination": destination}];
 
         taskToConfigMap[@(task.taskIdentifier)] = taskConfig;
@@ -169,7 +237,7 @@ RCT_EXPORT_METHOD(stopTask: (NSString *)identifier) {
 
 RCT_EXPORT_METHOD(checkForExistingDownloads: (RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
     [self lazyInitSession];
-    [urlSession getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> * _Nonnull dataTasks, NSArray<NSURLSessionUploadTask *> * _Nonnull uploadTasks, NSArray<NSURLSessionDownloadTask *> * _Nonnull downloadTasks) {
+    [backgroundSession getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> * _Nonnull dataTasks, NSArray<NSURLSessionUploadTask *> * _Nonnull uploadTasks, NSArray<NSURLSessionDownloadTask *> * _Nonnull downloadTasks) {
         NSMutableArray *idsFound = [[NSMutableArray alloc] init];
         @synchronized (sharedLock) {
             for (NSURLSessionDownloadTask *foundTask in downloadTasks) {
@@ -178,9 +246,9 @@ RCT_EXPORT_METHOD(checkForExistingDownloads: (RCTPromiseResolveBlock)resolve rej
                 if (taskConfig) {
                     if (task.state == NSURLSessionTaskStateCompleted && task.countOfBytesReceived < task.countOfBytesExpectedToReceive) {
                         if (task.error && task.error.code == -999 && task.error.userInfo[NSURLSessionDownloadTaskResumeData] != nil) {
-                            task = [urlSession downloadTaskWithResumeData:task.error.userInfo[NSURLSessionDownloadTaskResumeData]];
+                            task = [foregroundSession downloadTaskWithResumeData:task.error.userInfo[NSURLSessionDownloadTaskResumeData]];
                         } else {
-                            task = [urlSession downloadTaskWithURL:foundTask.currentRequest.URL];
+                            task = [foregroundSession downloadTaskWithURL:foundTask.currentRequest.URL];
                         }
                         [task resume];
                     }
