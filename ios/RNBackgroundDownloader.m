@@ -115,11 +115,11 @@ RCT_EXPORT_MODULE();
     if (state == kDownloadManagerStateBackground) {
         [backgroundSession getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
             for (NSURLSessionDownloadTask *backgroundTask in downloadTasks) {
+                RNBGDTaskConfig *taskConfig = taskToConfigMap[@(backgroundTask.taskIdentifier)];
+                
                 [backgroundTask cancelByProducingResumeData:^(NSData *resumeData) {
                     NSURLSessionDownloadTask *downloadTask = [foregroundSession downloadTaskWithResumeData:resumeData];
                     [downloadTask resume];
-                    
-                    RNBGDTaskConfig *taskConfig = taskToConfigMap[@(backgroundTask.taskIdentifier)];
                     if (taskConfig) {
                         idToTaskMap[taskConfig.id] = downloadTask;
                         taskToConfigMap[@(downloadTask.taskIdentifier)] = taskConfig;
@@ -276,19 +276,19 @@ RCT_EXPORT_METHOD(checkForExistingDownloads: (RCTPromiseResolveBlock)resolve rej
 #pragma mark - NSURLSessionDownloadDelegate methods
 - (void)URLSession:(nonnull NSURLSession *)session downloadTask:(nonnull NSURLSessionDownloadTask *)downloadTask didFinishDownloadingToURL:(nonnull NSURL *)location {
     @synchronized (sharedLock) {
-        RNBGDTaskConfig *taskCofig = taskToConfigMap[@(downloadTask.taskIdentifier)];
-        if (taskCofig != nil) {
+        RNBGDTaskConfig *taskConfig = taskToConfigMap[@(downloadTask.taskIdentifier)];
+        if (taskConfig != nil) {
             NSFileManager *fileManager = [NSFileManager defaultManager];
-            NSURL *destURL = [NSURL fileURLWithPath:taskCofig.destination];
+            NSURL *destURL = [NSURL fileURLWithPath:taskConfig.destination];
             [fileManager createDirectoryAtURL:[destURL URLByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
             [fileManager removeItemAtURL:destURL error:nil];
             NSError *moveError;
             BOOL moved = [fileManager moveItemAtURL:location toURL:destURL error:&moveError];
             if (self.bridge) {
                 if (moved) {
-                    [self sendEventWithName:@"downloadComplete" body:@{@"id": taskCofig.id}];
+                    [self sendEventWithName:@"downloadComplete" body:@{@"id": taskConfig.id}];
                 } else {
-                    [self sendEventWithName:@"downloadFailed" body:@{@"id": taskCofig.id, @"error": [moveError localizedDescription]}];
+                    [self sendEventWithName:@"downloadFailed" body:@{@"id": taskConfig.id, @"error": [moveError localizedDescription]}];
                 }
             }
             [self removeTaskFromMap:downloadTask];
